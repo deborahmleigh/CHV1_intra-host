@@ -1,0 +1,514 @@
+####Basic pipeline for obtaining from Intra-host data from PacBio HiFi Sequences 
+####written by Deborah M Leigh, please cite if using. This is just the barebones so if you need more info, please email me. 
+
+
+############
+############Script set up for modular execution as bash script so that you can check outputs and modify as needed
+############
+
+
+						############ Initial sequencing data processing ############
+
+############
+############ creating Circular consensus reads  
+############
+NThreads=6 # code for loops, this should match the cores or threads you want
+count=0    # starting the count at zero of the threads above 
+for i in {1..10} # this gives 'i' the value between 1 and 10 
+do 
+  samplename=$i   # this gives 'sample name' the value of i (1 through 10) this is used to put the number saved in 'i' in each file name 
+  ccs --minPasses=$i --minLength=3000 -j 6 --min-snr 3 --min-rq 0.99  --report-file report.${samplename}.ccs --log-file ccs.log.${samplename}.strand RAW.DATA.subreads.bam ${samplename}.passes.bam
+  # ccs is the miniconda3 program, minPasses is the number of times a sequence is read by the polymerase-this code cycles through the options 1-10, min SNR read quality filter, min RQ is a quality score this is set at 99 which is a phred score of 20. 
+  # report file tells you what reads were kept etc, log file tells you about the success of the run, this is followed by the raw data from the sequencing facility and finally the file/string name you want for the output file 
+        let count+=1  # this establishes the count above ensuring we use all the threads
+                if [[ $((count%${NThreads})) -eq 0 ]]
+                        then wait
+                fi
+done
+## 
+### end of 1 bash script. You will have quality filtered ccs reads that are still not aligned nor split by barcode. 
+
+
+############
+############ Splitting reads by barcodes into samples (called 'demultiplexing') 
+############
+
+lima --same --ccs --dump-clips --min-score 26 --split-bam --peek-guess   OUTPUT_PREV_COMMAND.bam   barcodes.fasta   STRING_ENDING_FOR_OUTPUT.bam 
+  # input is the ccs file from above (this should be chosen based on a balance between quality and quantity) and the 'barcodes.fasta' file, output is a file per sample
+  # the barcode file looks like this: 
+  # >SAMPLE_NAME
+  # CTATACATGACTCTGC
+  # >SAMPLE_NAME2 etc 
+  # you may want or need to add the primer site to the barcode
+
+############
+############ file format conversion to make demultiplexed files suitable for alignment
+############
+
+ for file in ./*bam
+do
+    samplename=$(basename $file .bam)
+    samtools bam2fq  $file  > ${samplename}.fastq
+    gzip ${samplename}.fastq 
+done
+
+
+
+						############ Standard data processing ############
+
+############
+############ alignment to genome sequences 
+############
+
+
+minimap2 -ax map-pb REFERENCE_GENOME  A_DEMULTIPLEXED_FILE.fastq.gz >   A_DEMULTIPLEXED_ALIGNED_FILE.sam
+samtools view -S -b A_DEMULTIPLEXED_ALIGNED_FILE.sam| samtools sort  -o A_DEMULTIPLEXED_ALIGNED_FILE.sorted.bam
+samtools index A_DEMULTIPLEXED_ALIGNED_FILE.sorted.bam
+qualimap bamqc -bam A_DEMULTIPLEXED_ALIGNED_FILE.sorted.bam --java-mem-size=4G
+
+
+
+############
+############ variant calling (I only considered SNPs identified by both programs downstream)
+############   
+
+freebayes -f  REFERENCE_GENOME  --ploidy 1 --pooled-discrete   --pooled-continuous -F 0.1  ALIGNED_FILE.bam_OR_LIST_OF_FILES >  OUTPUT_FILE.freebayes.vcf
+
+
+singularity pull docker://google/deepvariant:"${BIN_VERSION}"
+
+# add channels to conda configuration
+conda config --add channels defaults
+conda config --add channels bioconda
+conda config --add channels conda-forge
+
+# create the environment and install dependencies
+conda create -n deepvariant_whatshap
+conda activate deepvariant_whatshap
+conda install whatshap==1.0 samtools==1.10
+BIN_VERSION="1.0.0"
+
+singularity exec --bind /usr/lib/locale/ \
+   docker://google/deepvariant:${BIN_VERSION} \
+    /opt/deepvariant/bin/run_deepvariant \
+    --model_type PACBIO \
+    --ref  REFERENCE_GENOME \ 
+    --reads ALIGNED_FILE.bam \ 
+    --output_vcf= OUTPUT_FILE.deepvariant.vcf
+
+
+###########
+########### Establishing effect of mutations and calculating pi
+########### 
+
+java -Xmx4g -jar snpEff.jar GENOME_ANNOTATION YOUR_VCF_FILE > OUTPUT.snpeff
+snpgenie.pl --vcfformat=4 --snpreport=YOUR_VCF_FILE --fastafile=REFERENCE --gtffile=GENOME_ANNOTATION # the gtf file is the file used by SNPeff I think I just had to add a gtf ending
+
+
+###########
+########### Making a consensus 
+########### 
+bcftools consensus -f  REFERENCE  YOUR_VCF_FILE >  YOUR_CONSENSUS_FILE.fa
+
+###########
+########### RAxML
+########### 
+
+minimap2 -ax map-pb REFERENCE  YOUR_CONSENSUS_FILE.ALL.MERGED.TOGETHER.fa > YOUR_CONSENSUS_FILE.sam
+samtools view -S -b YOUR_CONSENSUS_FILE.sam | samtools sort  -o  YOUR_CONSENSUS_FILE.sorted.bam
+samtools index  YOUR_CONSENSUS_FILE.sorted.bam
+samtools view -h -o  YOUR_CONSENSUS_FILE.sorted.sam  YOUR_CONSENSUS_FILE.sorted.bam
+java -Xmx1024m -Xms512M -jar PGDSpider2-cli.jar -inputfile YOUR_CONSENSUS_FILE.sorted.bam -inputformat BAM -outputfile YOUR_CONSENSUS_FILE.sorted.fa -outputformat FASTA -spid BAM_to_FASTA.spid 
+
+
+cat YOUR_CONSENSUS_FILE.sorted.fa    | sed 's/ind_1 | population:Pop_1 | read://g' > YOUR_CONSENSUS_FILE.sorted.rn.fa
+raxml-ng --all --msa  YOUR_CONSENSUS_FILEs.sorted.rn.fa --model GTR+G --prefix TREE_NAME --seed $RANDOM --threads 2 --bs-metric fbp,tbe
+
+
+###########
+########### Denoising haplotypes
+########### ****IN JULIA**** follow the Murrell lab tutorial it's much more comprehensive  
+using NextGenSeqUtils,PyPlot,GraphPlot,LightGraphs,Colors,Compose
+using Statistics, PyPlot, NextGenSeqUtils, DPMeansClustering, RobustAmpliconDenoising
+
+
+seqs,phreds,seq_names = read_fastq("DEEMULTIPLEXED_SAMPLE_FASTQ")
+templates,template_sizes,template_indices = denoise(seqs)
+write_fasta("DENOISED.fastq",templates,names = ["seq$(j)_$(template_sizes[j])" for j in 1:length(template_sizes)])
+
+###########
+########### Orientate haplotypes
+###########
+gzip DENOISED.fastq
+minimap2 -ax map-pb REFERENCE_GENOME  DENOISED.fastq   > DENOISED.sam
+#calculate hamming distance using Pegas in R
+#Nie's H calculated using sequencing depth and haplotype number 
+
+
+###########
+########### Phyloscanner 
+###########
+
+
+ python ./phyloscanner_make_trees.py INPUT-FILE-LIST.txt  --auto-window-params 2500,0,101,5269  --num-bootstraps 100 --bootstrap-seed 45 --check-recombination  --alignment-of-other-refs ROOT 
+ ./phyloscanner_analyse_trees.R  ./RAxMLfiles/RAxML_bipartitionsBranchLabels.MLtreeWbootstrapsInWindow_  RunWithoutBlacklisting r,0 --multifurcationThreshold g   --outgroupName ROOT --recombinationFile ./RecombinationData/RecombinantReads_   --overwrite   --pdfWidth 10
+## run for r=0 and 12 and s=0 and 12 
+
+
+
+						############ Analyses in R ############
+#### qc metrics 
+
+all.samples.SNV.freq <- read.table("~/all.samples.SNV.freq", quote="\"", comment.char="")
+amp4.6<-subset(all.samples.SNV.freq,all.samples.SNV.freq$V1=='4.6kb')
+amp5<-subset(all.samples.SNV.freq,all.samples.SNV.freq$V1=='5kb')
+amp.merged<-merge(amp4.6,amp5,by=c("V2","V4"))
+amp.merged.fil<-subset(amp.merged,amp.merged$V4>877 & amp.merged$V4<5269)
+ab<-as.numeric(amp.merged.fil$V5.x)
+ac<-as.numeric(amp.merged.fil$V5.y)
+#difference in frequency 
+mean(abs(ab-ac))
+sd(abs(ab-ac))
+
+#difference in SNP number 
+variant.number.per.lib_both_prog <- read.csv("~/all.samples.SNV.number", sep="")
+diff1<-tapply(variant.number.per.lib_both_prog$Variant_number,variant.number.per.lib_both_prog$Sample,diff)
+mean(diff1)
+hist(abs(diff1))
+mean(abs(diff1))
+sd(abs(diff1))
+
+#total number of SNPs
+mean(variant.number.per.lib_both_prog$Variant_number)
+tapply(variant.number.per.lib_both_prog$Variant_number,variant.number.per.lib_both_prog$Amplicon,mean)
+tapply(variant.number.per.lib_both_prog$Variant_number,variant.number.per.lib_both_prog$Activity,mean)
+
+#haplotype infromation 
+h1<- read.delim("~/haplotypes.NeisH.corrected.txt")
+mean(h1$Corrected_haplotype_number)
+sd(h1$Corrected_haplotype_number)
+
+#haplo depth correlation
+
+m1<-lm(h1$Corrected_haplotype_number~h1$Total_haplotype)
+summary(m1)
+summary(m1)$r.squared
+
+m2<-lm(h1$Neis_h~h1$Total_haplotype)
+summary(m2)
+plot(h1$Total_haplotype,h1$Neis_h,xlab="Sequencing Depth",ylab="Intrahost Nei's H")
+plot(h1$Total_haplotype,h1$Corrected_haplotype_number,xlab="Sequencing Depth",ylab="Number of unique haplotypes")
+abline(m1)
+
+
+
+### intra-host mutational diversity analysis 
+pivic <- read.csv("~/pi.all.samples.txt", sep="")
+
+### Amplicon
+library(MASS)
+library(lme4)
+library(car)
+library("plyr")
+
+pivic1<-pivic
+pivic<-subset(pivic1,pivic1$Sample!="Con-19_23")  #amplicon is significant so removing the unbalance sample
+mod2<-lmer(sqrt(pi)~ActPvPty+vic1a+vic2+vic7+vic4+vic6+amplicon+Length+vic2:vic4+vic4:vic7+vic6:vic7+Pop2+amplicon:ActPvPty+(1|Sample),data=pivic,REML=F)
+Anova(mod2)
+Anova(mod2,type=3)
+mod3 <- update(mod2, ~.-vic1a , REML=FALSE)
+anova(mod3,mod2,test="Chi")
+Anova(mod3,type=3)
+mod4 <- update(mod3, ~.-vic2:vic4 , REML=FALSE)
+anova(mod3,mod4,test="Chi")
+Anova(mod4,type=3)
+summary(mod4)
+mod5 <- update(mod4, ~.-Length, REML=FALSE)
+anova(mod5,mod4,test="Chi")
+Anova(mod5,type=3)
+mod6 <- update(mod5, ~.-vic2, REML=FALSE)
+anova(mod5,mod6,test="Chi")
+Anova(mod6,type=3)
+summary(mod6)
+
+sort(tapply(pivic$pi,pivic$Population,mean)) #tested with Swiss divided into Con/Ors and combined as 1
+library(emmeans)
+emm = emmeans(mod6,"Pop2")
+pairs(emm)
+
+## calculating effect size 
+test1<- emmeans(mod6, "amplicon")
+eff_size(test1, sigma = sigma(mod6),edf=Inf)
+
+test1<- emmeans(mod6, "vic6")
+eff_size(test1, sigma = sigma(mod6),edf=Inf)
+
+test1<- emmeans(mod6, "vic4")
+eff_size(test1, sigma = sigma(mod6),edf=Inf)
+
+test1<- emmeans(mod6, "vic7")
+eff_size(test1, sigma = sigma(mod6),edf=Inf)
+
+test1<- emmeans(mod6, "ActPvPty")
+eff_size(test1, sigma = sigma(mod6),edf=Inf)
+
+test1<- emmeans(mod6, "Pop2")
+eff_size(test1, sigma = sigma(mod6),edf=Inf)
+
+
+emmeans(mod6, pairwise ~ vic4 | vic7)
+emmeans(mod6, pairwise ~ vic7 | vic4)
+
+emmeans(mod6, pairwise ~ vic6 | vic7)
+emmeans(mod6, pairwise ~ vic7 | vic6)
+
+emmeans(mod6, pairwise ~ amplicon | ActPvPty)
+emmeans(mod6, pairwise ~ ActPvPty | amplicon)
+
+#### data summary
+mean(pivic$pi)
+sd(pivic$pi)
+summary(pivic$pi)
+tapply(pivic$pi,pivic$ActPvPty,mean)
+tapply(pivic$pi,pivic$ActPvPty,sd)
+
+#### interaction plots
+library(interactions)
+cat_plot(mod6, pred = vic6, modx = vic7,geom="line",line.thickness =0.5,color.class="Set2")
+cat_plot(mod6, pred = vic4, modx = vic7,geom="line",line.thickness =0.5,color.class="Set2")
+cat_plot(mod6, pred = ActPvPty, modx = amplicon,geom="line",line.thickness =0.5,color.class="Set2")
+
+
+
+
+####intra-host haplotypic diversity analysis 
+
+#this is the data for the model where the 0's were transformed to 0.1
+h1<- read.delim("~/haplotypes.corrected.txt")
+
+#h1<-subset(h2,h2$Sample!="Con_19_23") # keeping this sample for the final model as amplicon is not significant but model reduction was done without this 
+
+rsp<-log(h1$Neis_h/(1-h1$Neis_h))
+hist(rsp)
+mod1<- lmer(rsp~Activity+Pop2+Length+vic1a+vic2+vic4+vic6+vic7+Amplicon+vic2:vic4+vic4:vic7+vic6:vic7+vic1a:vic6+vic4:vic6+vic2:vic7+Amplicon:Activity+(1|Sample),REML=F,data=h1)
+
+qqnorm(residuals(mod1))
+plot(mod1)
+Anova(mod1,type=3)
+mod2 <- update(mod1, ~.-Amplicon:Activity , REML=FALSE)
+anova(mod1,mod2,test="Chi")
+summary(mod2)
+Anova(mod2,type=3)
+
+mod3 <- update(mod2, ~.-Amplicon , REML=FALSE)
+anova(mod3,mod2,test="Chi")
+summary(mod3)
+Anova(mod3,type=3)
+
+mod4 <- update(mod3, ~.-MAT_ms , REML=FALSE)
+anova(mod3,mod4,test="Chi")
+summary(mod4)
+Anova(mod4,type=3)
+
+mod5 <- update(mod4, ~.-Length , REML=FALSE)
+anova(mod5,mod4,test="Chi")
+summary(mod5)
+Anova(mod5,type=3)
+
+mod6 <- update(mod5, ~.-vic4:vic6  , REML=FALSE)
+anova(mod5,mod6,test="Chi")
+summary(mod6)
+Anova(mod6,type=3)
+
+mod7 <- update(mod6, ~.-vic1a:vic6, REML=FALSE)
+anova(mod7,mod6,test="Chi")
+summary(mod7)
+Anova(mod7,type=3)
+
+mod8<- update(mod7, ~.-vic2:vic7, REML=FALSE)
+anova(mod7,mod8,test="Chi")
+summary(mod8)
+Anova(mod8,type=3)
+
+mod9<- update(mod8, ~.-vic1a, REML=FALSE)
+anova(mod9,mod8,test="Chi")
+summary(mod9)
+Anova(mod9,type=3)
+library(emmeans)
+emm = emmeans(mod9,"Pop2")
+pairs(emm)
+tapply(h1$Neis_h,h1$Population,mean)
+
+
+#### effect sizes 
+test1<- emmeans(mod9, "vic6")
+eff_size(test1, sigma = sigma(mod9),edf=Inf)
+
+test1<- emmeans(mod9, "vic4")
+eff_size(test1, sigma = sigma(mod9),edf=Inf)
+
+test1<- emmeans(mod9, "vic7")
+eff_size(test1, sigma = sigma(mod9),edf=Inf)
+
+test1<- emmeans(mod9, "vic2")
+eff_size(test1, sigma = sigma(mod9),edf=Inf)
+
+test1<- emmeans(mod9, "Activity")
+eff_size(test1, sigma = sigma(mod9),edf=Inf)
+
+test1<- emmeans(mod9, "Pop2")
+eff_size(test1, sigma = sigma(mod9),edf=Inf)
+
+emmeans(mod9, pairwise ~ vic6 | vic7)
+emmeans(mod9, pairwise ~ vic7 | vic6)
+
+emmeans(mod9, pairwise ~ vic2 | vic4)
+emmeans(mod9, pairwise ~ vic4 | vic2)
+
+emmeans(mod9, pairwise ~ vic4 | vic7)
+emmeans(mod9, pairwise ~ vic7 | vic4)
+
+
+
+library(interactions)
+cat_plot(mod9, pred = vic6, modx = vic7,geom="line",line.thickness =0.5,color.class="Set2")
+cat_plot(mod9, pred = vic6, modx = vic7,geom="line",line.thickness =0.5,color.class="Set2")
+cat_plot(mod9, pred = vic4, modx = vic2,geom="line",line.thickness =0.5,color.class="Set2")
+
+
+#for summary info without corrected haplotypes 
+haplotypes <- read.delim("~/haplotypes.NeisH")
+tapply(haplotypes$Neis_h,haplotypes$Activity,mean)
+tapply(haplotypes$Neis_h,haplotypes$Activity,sd)
+summary(haplotypes$Neis_h)
+sd(haplotypes$Neis_h)
+
+library(emmeans)
+emm = emmeans(mod9,"Pop2")
+pairs(emm)
+tapply(h1$Neis_h,h1$Population,mean)
+
+
+
+
+####intra-host subgraph number analysis 
+
+
+
+subgraphs.5 <- read.delim("~/subgraphs.txt")
+subs<-subset(subgraphs.5,subgraphs.5$tree.id!="3177_to_5476"&subgraphs.5$tree.id!="2600_to_5099"&subgraphs.5$Sample!="Con_19_23") # deleting replicate means 
+mod1<- lmer(log(mean_subgraphs)~Activity+Pop2+vic1a+vic2+vic4+vic6+vic7+Amplicon+vic2:vic4+vic4:vic7+vic6:vic7+vic4:vic6+vic2:vic7+Amplicon:Activity+(1|Sample),data=subs,REML=F)
+qqnorm(residuals(mod1))
+plot(mod1)
+summary(mod1)
+Anova(mod1,type=3)
+mod2 <- update(mod1, ~.-Amplicon:Activity)
+anova(mod1,mod2,test="Chi")
+summary(mod2)
+Anova(mod2,type=3)
+mod3 <- update(mod2, ~.-vic4:vic6)
+anova(mod3,mod2,test="Chi")
+summary(mod3)
+Anova(mod3,type=3)
+mod4 <- update(mod3, ~.-vic1a:vic6)
+anova(mod3,mod4,test="Chi")
+summary(mod4)
+Anova(mod4,type=3)
+mod5 <- update(mod4, ~.-vic4:vic7)
+anova(mod5,mod4,test="Chi")
+summary(mod5)
+Anova(mod5,type=3)
+mod6 <- update(mod5, ~.-vic2:vic4)
+anova(mod5,mod6, test="Chi")
+summary(mod6)
+Anova(mod6,type=3)
+mod7 <- update(mod6, ~.-Activity)
+anova(mod7,mod6, test="Chi")
+summary(mod7)
+Anova(mod7,type=3)
+mod8 <- update(mod7, ~.-Pop2)
+anova(mod7,mod8, test="Chi")
+summary(mod8)
+Anova(mod8,type=3)
+mod9 <- update(mod8, ~.-vic1a)
+anova(mod9,mod8, test="Chi")
+summary(mod9)
+Anova(mod9,type=3)
+mod10 <- update(mod9, ~.-vic4)
+anova(mod9,mod10, test="Chi")
+summary(mod10)
+Anova(mod10,type=3)
+interaction.plot(subs$vic7,subs$vic2,log(subs$mean_subgraphs))
+interaction.plot(subs$vic6,subs$vic7,log(subs$mean_subgraphs))
+tapply(subs$mean_subgraphs,subs$Amplicon,mean)
+tapply(subs$mean_subgraphs,subs$Amplicon,sd)
+mean(subs$mean_subgraphs)
+sd(subs$mean_subgraphs)
+cat_plot(mod10, pred = vic6, modx = vic7,geom="line",line.thickness =0.5,color.class="Set2")
+cat_plot(mod10, pred = vic2, modx = vic7,geom="line",line.thickness =0.5,color.class="Set2")
+
+test1<- emmeans(mod10, "vic6")
+eff_size(test1, sigma = sigma(mod10),edf=Inf)
+
+test1<- emmeans(mod10, "vic2")
+eff_size(test1, sigma = sigma(mod10),edf=Inf)
+
+test1<- emmeans(mod10, "vic7")
+eff_size(test1, sigma = sigma(mod10),edf=Inf)
+
+test1<- emmeans(mod10, "Amplicon")
+eff_size(test1, sigma = sigma(mod10),edf=Inf)
+
+emmeans(mod10, pairwise ~ vic6 | vic7)
+emmeans(mod10, pairwise ~ vic7 | vic6)
+emmeans(mod10, pairwise ~ vic2 | vic7)
+emmeans(mod10, pairwise ~ vic7 | vic2)
+
+#### looking for signals of selection 
+samples_pa <- read.delim("~/samples_details.txt")
+pi.merged <- read.csv("~/pi.values", sep="")
+pi.all<-merge(samples_pa ,pi.merged,by=c("Sample"))
+
+four<-subset(pi.all,pi.all$amplicon=='4.6kb')
+five<-subset(pi.all,pi.all$amplicon=='5kb')
+
+
+t.test(pi.all$piN,pi.all$piS,paired=TRUE)
+mean(pi.all$piN)
+mean(pi.all$piS)
+sd(pi.all$piN)
+sd(pi.all$piS)
+sort(tapply(pi1$ratio1,pi1$Sample,mean))
+t.test(four$piN,four$piS,paired=TRUE)
+mean(four$piN)
+mean(four$piS)
+sd(four$piN)
+sd(four$piS)
+t.test(five$piN,five$piS,paired=TRUE)
+mean(five$piN)
+mean(five$piS)
+sd(five$piN)
+sd(five$piS)
+
+
+##### sorting out haplotypes to get Hamming distance and metrics for Neis H
+
+
+BiocManager::install('msa') 
+BiocManager::install('Rsamtools') 
+library(msa)
+library(Rsamtools)
+library(pegas)
+options(max.print=1000000)
+## read sequences
+
+mySeqs <-("A_ALIGNED_DENOISED_SORTED_FASTA")
+
+ab<-fasta2DNAbin(mySeqs, quiet=FALSE, chunkSize=10, snpOnly=FALSE)
+dist.hamming(ab)
+ah<-haplotype(ab,strict=FALSE,what="Length",trailingGapsAsN=FALSE)
+ah
+dist.hamming(ah)
+plot(sort(ah))
+hap.div(ah)
+haploFreq(ah)
