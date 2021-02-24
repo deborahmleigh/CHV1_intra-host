@@ -72,7 +72,7 @@ qualimap bamqc -bam A_DEMULTIPLEXED_ALIGNED_FILE.sorted.bam --java-mem-size=4G
 ############ variant calling (I only considered SNPs identified by both programs downstream)
 ############   
 
-freebayes -f  REFERENCE_GENOME  --ploidy 1 --pooled-discrete   --pooled-continuous -F 0.1  ALIGNED_FILE.bam_OR_LIST_OF_FILES >  OUTPUT_FILE.freebayes.vcf
+freebayes -f  REFERENCE_GENOME  --ploidy 1 --pooled-discrete   --pooled-continuous   ALIGNED_FILE.bam_OR_LIST_OF_FILES >  OUTPUT_FILE.freebayes.vcf
 
 
 singularity pull docker://google/deepvariant:"${BIN_VERSION}"
